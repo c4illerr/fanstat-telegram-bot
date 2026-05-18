@@ -1,0 +1,16 @@
+{
+  "name": "your-bot-name",
+  "version": "1.0.0",
+  "description": "Мои боты",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@foile/crypto-pay-api": "^1.1.2",
+    "axios": "^1.6.0",
+    "express": "^4.18.2",
+    "node-telegram-bot-api": "^0.64.0",
+    "sqlite3": "^5.1.6" 
+  }
+}
