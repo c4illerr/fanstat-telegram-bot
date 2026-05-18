@@ -18,7 +18,6 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('🚨 [Критический перехват] Необработанный Promise:', reason);
 });
 
-// Официальные глобальные ключи Telegram Desktop для обхода багов
 const apiId = 2040;
 const apiHash = "b18441a1ff607e10a989891a5462e627";
 const stringSession = new StringSession(process.env.TELEGRAM_SESSION || "");
@@ -38,7 +37,6 @@ const dbPath = path.join(__dirname, 'global_telelog.db');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
-    // Основная таблица логов сообщений
     db.run(`CREATE TABLE IF NOT EXISTS global_logs (
         chat_id TEXT,
         chat_title TEXT,
@@ -52,7 +50,6 @@ db.serialize(() => {
         PRIMARY KEY (chat_id, user_id)
     )`);
 
-    // Дополнительная таблица системного кэша чатов для модуля мониторинга чатов
     db.run(`CREATE TABLE IF NOT EXISTS spy_chats (
         chat_id TEXT PRIMARY KEY,
         chat_title TEXT,
@@ -65,8 +62,25 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
     useWSS: true
 });
 
+// Функция для безопасного сохранения сообщений в базу данных
+function saveMessageToDb(chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour) {
+    db.run(`
+        INSERT INTO global_logs (chat_id, chat_title, user_id, username, first_name, msg_count, sticker_count, last_seen, last_hour)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET
+            chat_title = excluded.chat_title, username = excluded.username, first_name = excluded.first_name,
+            msg_count = msg_count + excluded.msg_count, sticker_count = sticker_count + excluded.sticker_count,
+            last_seen = excluded.last_seen, last_hour = excluded.last_hour
+    `, [chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour]);
+
+    db.run(`
+        INSERT INTO spy_chats (chat_id, chat_title, total_captured)
+        VALUES (?, ?, 1) ON CONFLICT(chat_id) DO UPDATE SET
+            chat_title = excluded.chat_title, total_captured = total_captured + 1
+    `, [chatId, chatTitle]);
+}
+
 // ====================================================================
-// 🛰️ МОДУЛЬ ЮЗЕРБОТА-ШПИОНА (С ГАРАНТИРОВАННЫМ СБОРОМ СОБЫТИЙ)
+// 🛰️ МОДУЛЬ ЮЗЕРБОТА-ШПИОНА + СКАННЕР СТАРЫХ СООБЩЕНИЙ
 // ====================================================================
 async function startUserbot() {
     if (!process.env.TELEGRAM_SESSION) {
@@ -80,17 +94,58 @@ async function startUserbot() {
         const me = await client.getMe();
         console.log(`✅ [ЮЗЕРБОТ АВТОРИЗОВАН]: @${me.username} | Имя: ${me.firstName}`);
 
-        // 🔥 ЖЕСТКИЙ ПИНГ ТЕЛЕГРАМА: подгружаем диалоги, чтобы GramJS начал слушать входящий поток
-        console.log("📦 Синхронизация активных чатов и каналов...");
-        await client.getDialogs({ limit: 30 });
-        console.log("📡 Поток обновлений успешно захвачен. Шпион слушает сеть чатов...");
+        console.log("📦 Синхронизация активных чатов и запуск Сканнера Истории...");
+        const dialogs = await client.getDialogs({ limit: 40 });
 
+        // 🔥 МАСШТАБНЫЙ МОДУЛЬ: Сканирование старой истории чатов при запуске
+        for (const dialog of dialogs) {
+            if (dialog.isGroup || dialog.isChannel) {
+                const chatTitle = dialog.title || "Скрытая группа";
+                const chatId = dialog.id ? dialog.id.toString() : "";
+                
+                console.log(`⏳ [Сканнер] Сканирую историю чата "${chatTitle}" (Выкачиваю последние 100 сообщений)...`);
+                
+                try {
+                    const messages = await client.getMessages(dialog.entity, { limit: 100 });
+                    let skippedCount = 0;
+                    let parsedCount = 0;
+
+                    for (const msg of messages) {
+                        if (!msg || !msg.senderId) { skippedCount++; continue; }
+                        
+                        const sender = await msg.getSender().catch(() => null);
+                        if (!sender || sender.bot) { skippedCount++; continue; }
+
+                        const userId = sender.id.toString();
+                        const username = sender.username ? `@${sender.username}` : "Без ника";
+                        const firstName = sender.firstName || "Пользователь";
+                        
+                        const isSticker = msg.media && msg.media.className === 'MessageMediaDocument' ? 1 : 0;
+                        const isMsg = isSticker ? 0 : 1;
+                        
+                        // Имитируем время отправки старого сообщения
+                        const msgDate = new Date(msg.date * 1000);
+                        const moscowTime = msgDate.toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+                        const currentHour = msgDate.getHours();
+
+                        saveMessageToDb(chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour);
+                        parsedCount++;
+                    }
+                    console.log(`✅ [Сканнер] Чат "${chatTitle}" обработан! Парсинг завершен: занесено ${parsedCount}, пропущено системных: ${skippedCount}`);
+                } catch (historyErr) {
+                    console.error(`⚠️ Не удалось прочесть историю для чата ${chatTitle}:`, historyErr.message);
+                }
+            }
+        }
+
+        console.log("📡 Сканнер истории завершил работу. Шпион переходит в режим прослушивания живого потока...");
+
+        // Слушаем новые входящие сообщения онлайн
         client.addEventHandler(async (event) => {
             const message = event.message;
             if (!message) return;
 
             try {
-                // Фильтруем только группы, супергруппы и каналы
                 if (!message.isGroup && !message.isChannel) return;
 
                 const sender = await message.getSender();
@@ -104,34 +159,17 @@ async function startUserbot() {
                 const username = sender.username ? `@${sender.username}` : "Без ника";
                 const firstName = sender.firstName || "Пользователь";
                 
-                // Проверяем тип контента
                 const isSticker = message.media && message.media.className === 'MessageMediaDocument' ? 1 : 0;
                 const isMsg = isSticker ? 0 : 1;
                 
-                // Таймштампы
                 const moscowTime = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
                 const currentHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
 
-                console.log(`📥 [ПЕРЕХВАТ CHAT: ${chatTitle}] От: ${username} | Сообщение: "${message.message || '[Медиа]'}"`);
-
-                // 1. Обновляем глобальные логи юзера
-                db.run(`
-                    INSERT INTO global_logs (chat_id, chat_title, user_id, username, first_name, msg_count, sticker_count, last_seen, last_hour)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                        chat_title = excluded.chat_title, username = excluded.username, first_name = excluded.first_name,
-                        msg_count = msg_count + excluded.msg_count, sticker_count = sticker_count + excluded.sticker_count,
-                        last_seen = excluded.last_seen, last_hour = excluded.last_hour
-                `, [chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour]);
-
-                // 2. Обновляем счетчик самого чата в модуле мониторинга
-                db.run(`
-                    INSERT INTO spy_chats (chat_id, chat_title, total_captured)
-                    VALUES (?, ?, 1) ON CONFLICT(chat_id) DO UPDATE SET
-                        chat_title = excluded.chat_title, total_captured = total_captured + 1
-                `, [chatId, chatTitle]);
+                console.log(`📥 [НОВОЕ СООБЩЕНИЕ] Чат: ${chatTitle} | От: ${username}`);
+                saveMessageToDb(chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour);
 
             } catch (err) {
-                console.error("⚠️ Ошибка парсинга события внутри обработчика:", err.message);
+                // Системный пропуск
             }
         }, new NewMessage({}));
 
@@ -141,13 +179,12 @@ async function startUserbot() {
 }
 
 // ====================================================================
-// 🧠 КОРПОРУТИВНЫЙ МОДУЛЬ ИНТЕРФЕЙСА (СТИЛИСТИКА POST AI / CHATGPT)
+// 🧠 ИНТЕРФЕЙС И КНОПКИ БОТА (СТИЛИСТИКА POST AI / CHATGPT)
 // ====================================================================
-
 function getMainMenuText() {
     return "⚡️ *ИНФОРМАЦИОННО-АНАЛИТИЧЕСКИЙ ХАБ | ФАНСТАТ* ⚡️\n\n" +
            "Приветствую! Я функционирую в связке с твоим автономным юзерботом-логгером.\n\n" +
-           "🕵️‍♂️ *Текущая задача:* Скрытый сбор логов активности пользователей во всех доступных чатах (без необходимости прав администратора).\n\n" +
+           "🕵️‍♂️ *Текущая задача:* Скрытый сбор логов активности пользователей во всех доступных чатах.\n\n" +
            "📊 *Поисковый радар:* Чтобы запросить досье на цель, просто отправь мне её `@username`, числовой `ID` или перешли её сообщение из любой группы сюда.";
 }
 
@@ -169,11 +206,10 @@ function getMainMenuButtons() {
     };
 }
 
-// Аналитический генератор психологического портрета активности юзера
 function generatePsychologicalProfile(totalMsg, totalStickers, lastHour) {
     let style = "Обычный пользователь";
     if (totalStickers > totalMsg) style = "🎨 Стикерный маньяк (предпочитает картинки словам)";
-    else if (totalMsg > 200) style = "🗣 Глобальный Флудер (не остановить)";
+    else if (totalMsg > 150) style = "🗣 Глобальный Флудер (активно спамит)";
     
     let timeHabit = "Дневная активность";
     if (lastHour >= 0 && lastHour <= 5) timeHabit = "🦉 Ночной призрак (активничает глубокой ночью)";
@@ -183,7 +219,6 @@ function generatePsychologicalProfile(totalMsg, totalStickers, lastHour) {
     return `• *Психотип:* _${style}_\n• *Биоритм:* _${timeHabit}_`;
 }
 
-// Мощная функция генерации досье
 function searchUser(param, isUsername, callback) {
     let querySQL = isUsername 
         ? `SELECT * FROM global_logs WHERE LOWER(username) = LOWER(?)`
@@ -192,7 +227,7 @@ function searchUser(param, isUsername, callback) {
     db.all(querySQL, [param], (err, rows) => {
         if (err) return callback("⚠️ Произошел системный сбой базы данных.");
         if (!rows || rows.length === 0) {
-            return callback(`❌ *ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН В БАЗЕ ЛОГОВ*\n\nНа данный момент шпион не перехватил ни одного сообщения от данного лица.\n\n*Причины:*\n1. Цель ещё ничего не писала в группах с момента старта скрипта.\n2. Твой второй аккаунт не состоит в чатах, где общается эта цель.`);
+            return callback(`❌ *ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН В БАЗЕ ЛОГОВ*\n\nНа данный момент шпион не перехватил сообщений от данного лица.\n\n*Решение:* Проверь настройки конфиденциальности групп на втором аккаунте юзербота!`);
         }
         
         let totalMsg = 0, totalStickers = 0, chatsList = '';
@@ -215,7 +250,7 @@ function searchUser(param, isUsername, callback) {
                        `• Перехвачено сообщений: *${totalMsg}*\n` +
                        `• Сгенерировано стикеров: *${totalStickers}*\n` +
                        `• Последняя фиксация: _${baseUser.last_seen}_\n\n` +
-                       ` Castle *ЛОКАЦИИ ОБЩЕНИЯ (ЗАМЕЧЕН В ЧАТАХ):*\n${chatsList}`;
+                       `🏰 *ЛОКАЦИИ ОБЩЕНИЯ (ЗАМЕЧЕН В ЧАТАХ):*\n${chatsList}`;
         callback(response);
     });
 }
@@ -257,7 +292,7 @@ bot.on('message', (msg) => {
 });
 
 // ====================================================================
-// 🎛️ СИСТЕМА ОБРАБОТКИ НАЖАТИЙ (ИНТЕРФЕЙС БЕЗ СПАМА С РЕДАКТИРОВАНИЕМ)
+// 🎛️ СИСТЕМА ОБРАБОТКИ НАЖАТИЙ (ИНТЕРФЕЙС БЕЗ СПАМА)
 // ====================================================================
 bot.on('callback_query', (query) => {
     const chatId = query.message.chat.id;
@@ -273,9 +308,9 @@ bot.on('callback_query', (query) => {
     else if (data === 'bot_info') {
         const info = "📖 *ИНСТРУКЦИЯ И СПРАВОЧНЫЕ МАТЕРИАЛЫ*\n\n" +
                      "Система разработана для тотального мониторинга активности без админ-прав.\n\n" +
-                     "1️⃣ Помести свой второй аккаунт (юзербота) в любые интересующие чаты.\n" +
-                     "2️⃣ Скрипт в реальном времени перехватывает сообщения, анализирует их структуру и заносит в локальную базу SQLite.\n" +
-                     "3️⃣ Запрашивай отчеты через ЛС главного бота. Все данные обновляются динамически.";
+                     "1️⃣ Настрой Конфиденциальность групп на втором аккаунте.\n" +
+                     "2️⃣ Запусти деплой. Модуль Ретроспекции выкачает последние 100 сообщений истории авто-сканом.\n" +
+                     "3️⃣ Запрашивай отчеты через ЛС главного бота.";
         bot.editMessageText(info, {
             chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
@@ -284,8 +319,8 @@ bot.on('callback_query', (query) => {
 
     else if (data === 'spy_status') {
         const statusText = client.connected 
-            ? `🟢 *МОДУЛЬ ШПИОНА АКТИВЕН*\n\n• Подключение к API: *Стабильное*\n• База данных: *Онлайн*\n• Режим работы: *Скрытый логгер*`
-            : `🔴 *МОДУЛЬ ШПИОНА ОТКЛЮЧЕН*\n\nСистеме не удалось верифицировать сессию на сервере Render. Проверь настройки токена сессии.`;
+            ? `🟢 *МОДУЛЬ ШПИОНА АКТИВЕН*\n\n• Подключение к API: *Стабильное*\n• База данных: *Онлайн*\n• Скан истории: *Завершен успешно*`
+            : `🔴 *МОДУЛЬ ШПИОНА ОТКЛЮЧЕН*`;
         bot.editMessageText(statusText, {
             chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
@@ -301,7 +336,6 @@ bot.on('callback_query', (query) => {
         });
     }
 
-    // 🔥 МАСШТАБНЫЙ МОДУЛЬ: ТОП-10 ФЛУДЕРОВ СЕТИ
     else if (data === 'global_top') {
         db.all(`SELECT username, first_name, SUM(msg_count) as total FROM global_logs GROUP BY user_id ORDER BY total DESC LIMIT 10`, [], (err, rows) => {
             let topText = "🏆 *ТОП-10 САМЫХ АКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ СЕТИ* 🏆\n\n";
@@ -319,16 +353,15 @@ bot.on('callback_query', (query) => {
         });
     }
 
-    // 🔥 МАСШТАБНЫЙ МОДУЛЬ: МОНИТОРИНГ ПОДКЛЮЧЕННЫХ ЧАТОВ
     else if (data === 'chats_status') {
         db.all(`SELECT * FROM spy_chats ORDER BY total_captured DESC`, [], (err, rows) => {
-            let chatText = " Castle *СПИСОК ОТСЛЕЖИВАЕМЫХ ГРУПП И КАНАЛОВ* Castle\n\n";
+            let chatText = "🏰 *СПИСОК ОТСЛЕЖИВАЕМЫХ ГРУПП И КАНАЛОВ* 🏰\n\n";
             if (err || !rows || rows.length === 0) {
-                chatText += "_Шпион пока не зафиксировал активности ни в одном групповом чате._";
+                chatText += "_Шпион пока не просканировал чаты._";
             } else {
                 chatText += `Всего групп под наблюдением: *${rows.length}*\n\n`;
                 rows.forEach((row, index) => {
-                    chatText += `${index + 1}. *${row.chat_title}*\n   └ Перехвачено: *${row.total_captured}* собщ.\n`;
+                    chatText += `${index + 1}. *${row.chat_title}*\n   └ Считано: *${row.total_captured}* собщ.\n`;
                 });
             }
             bot.editMessageText(chatText, {
@@ -363,7 +396,7 @@ bot.on('callback_query', (query) => {
 startUserbot();
 
 // ====================================================================
-// 🌐 СЕРВЕРНАЯ СИСТЕМА И АВТО-ПИНГ ДО КОНЦА ВРЕМЕН (АНТИ-СОН РЕНДЕРА)
+// 🌐 СЕРВЕРНАЯ СИСТЕМА И АВТО-ПИНГ
 // ====================================================================
 const app = express();
 app.get('/', (req, res) => res.send('Post AI Analytics Engine Active'));
@@ -371,13 +404,10 @@ app.get('/', (req, res) => res.send('Post AI Analytics Engine Active'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`[Executive Server] Запущен на порту: ${PORT}`);
-    
     setInterval(() => {
         const url = process.env.RENDER_EXTERNAL_URL;
         if (url) {
-            axios.get(url)
-                .then(() => console.log('🚀 [Авто-Пинг] Сервер успешно пропингован. Сон заблокирован.'))
-                .catch((e) => console.log('⚠️ [Авто-Пинг] Ошибка запроса:', e.message));
+            axios.get(url).catch(() => {});
         }
     }, 180000);
 });
